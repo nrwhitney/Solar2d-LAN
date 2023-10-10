@@ -1,21 +1,58 @@
 local socket = require( "socket" )  -- Connection to socket library
-local JSON = require("json")
+--local JSON = require("json")
 
-local function connectToServer( ip, port )
-    local sock, err = socket.connect( ip, port )
-    if sock == nil then
-        return false
-    end
-    sock:settimeout( 0 )
-    sock:setoption( "tcp-nodelay", true )  --disable Nagle's algorithm
-    return sock
+--local fallBackAddress = "8.8.8.8"
+
+-- Check if this is socket 2 or later
+local isSocket2 = (string.match( require("socket")._VERSION, "LuaSocket 2" ) ~= nil )
+--print (isSocket2)
+
+local forceIPV4 	= true
+--local forceIPV4 	= false
+
+local socketUDP 	= (isSocket2) and socket.udp or(socket.udp6 or socket.udp4 or socket.udp) 
+local socketTCP 	= (isSocket2) and socket.tcp or(socket.tcp6 or socket.tcp4 or socket.tcp) 
+
+if( forceIPV4 and isSocket2 == false ) then
+	socketUDP 	= socket.udp4 or socket.udp 
+	socketTCP 	= socket.tcp4 or socket.tcp
 end
 
-local function getIP()
-    local s = socket.udp()  --creates a UDP object
-    s:setpeername( "74.125.115.104", 80 )  --Google website
-    local ip, sock = s:getsockname()
-    return ip
+-- If we are using Socket 3, we still need to determine if the local network is
+-- ipv4 or ipv6 compliant.  Assume it is, but test for failure
+--local ipv6Test = true
+--if( isSocket2 == false ) then
+--	local socketTest1 = socket.udp6()
+--	socketTest1:setpeername( "google.com", 54613 )
+--	local testPeerIP = socketTest1:getsockname()
+--	if (testPeerIP == "::") then
+--		ipv6Test = false
+--	end
+--end
+
+--print("ipv6Test:",ipv6Test)
+
+--local peerIP, peerPort 
+--local s = socketUDP()
+--s:setpeername( "google.com", 54613 )
+--peerIP, peerPort = s:getsockname(), 54613
+
+--if( peerIP == nil ) then
+--	s:setpeername( fallBackAddress, 54613 )
+--	peerIP, peerPort = s:getsockname(), 54613
+--end
+--s = nil
+--print("Network:", peerIP, peerPort, socketUDP, socketTCP )
+
+local function connectToServer( ip, port )
+    local tcp = socketTCP()
+    tcp:connect( ip, port )
+    if tcp == nil then
+        return false
+    end
+    tcp:settimeout( 0 )
+    tcp:setoption( "tcp-nodelay", true )  --disable Nagle's algorithm
+    return tcp
 end
 
 local function Split(inputstr, sep)
@@ -57,24 +94,19 @@ local Client = {}
     Client.StartFind = function( port )
         FoundServers = {}
         if ServerBroadcastFinder == nil then
-            local connectionMessage = "M1sT0xS3rv3r"
+            local connectionMessage = "g00pS3rv3r"
 
-            FindSock = socket.udp()
-            if system.getInfo( "environment" ) == "simulator" then -- if isEditor then
-                assert(FindSock:setsockname( getIP(), port ))
-            else
-                assert(FindSock:setsockname( "239.1.1.234", port ))
-                assert(FindSock:setoption( "ip-add-membership", { multiaddr="239.1.1.234", interface = getIP() } ))
-            end
-
+--            FindSock = socket.udp4()
+            FindSock = socketUDP()
+            FindSock:setsockname("*", port)
             FindSock:settimeout(0)
 
             local function look()
                 repeat
                     local data, ip, port = FindSock:receivefrom()
                     if data then
-                        local conMsg = string.sub(data, 1, 12)
-                        local sName = string.sub(data, 13)
+                        local conMsg = string.sub(data, 1, 10)
+                        local sName = string.sub(data, 11)
                         if conMsg == connectionMessage then
                             if not FoundServers[ip] then
                                 FoundServers[ip] = {ip, sName}
@@ -84,7 +116,6 @@ local Client = {}
                     end
                 until not data
              end
-         
              ServerBroadcastFinder = timer.performWithDelay( 100, look, 0 )
          end
     end
@@ -106,7 +137,9 @@ local Client = {}
         Ctrl.SendBuffer = {}
 
         Ctrl.SendTo = function(UIDorUserName, Function, Args)
-            table.insert( Ctrl.SendBuffer, UID.."|"..BuildFunction(Function, Args) )
+--            table.insert( Ctrl.SendBuffer, UID.."|"..BuildFunction(Function, Args) )
+            table.insert( Ctrl.SendBuffer, UIDorUserName.."|"..BuildFunction(Function, Args) )
+            
         end
 
         Ctrl.Send = function(Function, Args)
@@ -114,6 +147,8 @@ local Client = {}
         end
 
         Ctrl.StopClient = function()
+            -- print("** STOPPING CLIENT **")
+            Ctrl.SendBuffer = {}
             timer.cancel( Ctrl.clientPulse )
             Ctrl.clientPulse = nil
             if type(Ctrl.ClientSock) ~= "boolean" then
@@ -126,29 +161,35 @@ local Client = {}
 
             local allData = {}
             local data, err
-     
+
             -- Receive
             repeat
                 data, err = Ctrl.ClientSock:receive()
                 if data then
                     table.insert( allData, data )
                 end
+
                 if ( err == "closed" and Ctrl.clientPulse ) then
                     Ctrl.ClientSock = connectToServer( ip, port )
+                    -- print("type:", type(Ctrl.ClientSock))
                     if type(Ctrl.ClientSock) ~= "boolean" then
                         data, err = Ctrl.ClientSock:receive()
-                        if data then
-                            table.insert( allData, data )
+                        -- print("---", data, err, "---")
+                        if err ~= "Socket is not connected" then
+                            if data then
+                                table.insert( allData, data )
+                            end
+                        else
+                            if Ctrl.onDisconnect ~= nil then Ctrl.onDisconnect(err) end
+                            Ctrl.StopClient()
                         end
-                    else
-                        if Ctrl.onDisconnect ~= nil then Ctrl.onDisconnect(err) end
-                        Ctrl.StopClient()
                     end
                 end
             until not data
      
             if ( #allData > 0 ) then
                 for i, thisData in ipairs( allData ) do
+
                     local FunctionSeperator = Split(thisData, "|")
                     local funct = FunctionSeperator[1]
                     -- Check to see if args is a string or table or nil
@@ -157,7 +198,8 @@ local Client = {}
                         args = Split( FunctionSeperator[2], "/")
                     end
                     if funct == "SetUID" then
-                        Ctrl.UID = args[1]
+--                        Ctrl.UID = args[1]
+                        Ctrl.UID = args
                     else
                         if Ctrl.onReceive ~= nil then Ctrl.onReceive( funct, args ) end
                     end
@@ -166,7 +208,7 @@ local Client = {}
             
             for i, msg in pairs( Ctrl.SendBuffer ) do
                 local data, err = Ctrl.ClientSock:send(msg)
-                if ( err == "closed" and clientPulse ) then
+                if ( err == "closed" and Ctrl.clientPulse ) then
                     Ctrl.ClientSock = connectToServer( ip, port )
                     data, err = Ctrl.ClientSock:send( msg )
                 end
@@ -174,8 +216,8 @@ local Client = {}
             end
         end
 
-        Ctrl.clientPulse = timer.performWithDelay( 100, cPulse, 0 )
-
+        Ctrl.clientPulse = timer.performWithDelay( 20, cPulse, 0 )
+--        Ctrl.clientPulse = timer.performWithDelay( 100, cPulse, 0 )
         return Ctrl
     end
 
